@@ -1,11 +1,35 @@
 // _worker.js
 
-// Docker镜像仓库主机地址
-let hub_host = 'registry-1.docker.io';
-// Docker认证服务器地址
-const auth_url = 'https://auth.docker.io';
+// Docker镜像仓库默认上游地址（常量；实际上游在每个请求内单独计算）
+// 想让裸域名直接反代 ghcr.io（例如拉 octop），把下面改成 'ghcr.io'
+const DEFAULT_HUB_HOST = 'registry-1.docker.io';
 
-let 屏蔽爬虫UA = ['netcraft'];
+// 各上游对应的认证端点。这是能否拉到非 Docker Hub 镜像的关键：
+//   realm   —— 换取 token 的地址前缀（脚本会拼上 /token?...）
+//   service —— scope 请求里的 service 值，必须与该上游一致，否则拿到的 token 无效
+const AUTH_ENDPOINTS = {
+	'registry-1.docker.io': { realm: 'https://auth.docker.io', service: 'registry.docker.io' },
+	'ghcr.io': { realm: 'https://ghcr.io', service: 'ghcr.io' },
+	'quay.io': { realm: 'https://quay.io', service: 'quay.io' },
+	'gcr.io': { realm: 'https://gcr.io', service: 'gcr.io' },
+	'k8s.gcr.io': { realm: 'https://gcr.io', service: 'gcr.io' },
+	'registry.k8s.io': { realm: 'https://registry.k8s.io', service: 'registry.k8s.io' },
+	'nvcr.io': { realm: 'https://nvcr.io', service: 'nvcr.io' },
+	'docker.cloudsmith.io': { realm: 'https://docker.cloudsmith.io', service: 'docker.cloudsmith.io' },
+};
+
+// 取上游对应的认证配置；未知上游按 Registry v2 通用约定兜底
+function authFor(host) {
+	return AUTH_ENDPOINTS[host] || { realm: `https://${host}`, service: host };
+}
+
+// 正则转义，避免 realm 里的 . 和 / 被当成元字符
+function escapeRe(s) {
+	return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+// 基础屏蔽UA清单（常量，请求中绝不修改，避免同一 isolate 内无限增长）
+const 屏蔽爬虫UA = ['netcraft'];
 
 // 根据主机名选择对应的上游地址
 function routeByHosts(host) {
@@ -20,12 +44,15 @@ function routeByHosts(host) {
 		"cloudsmith": "docker.cloudsmith.io",
 		"nvcr": "nvcr.io",
 
+		// Docker Hub（显式前缀，方便默认上游切到 ghcr 后仍能用 Docker Hub）
+		"docker": "registry-1.docker.io",
+
 		// 测试环境
 		"test": "registry-1.docker.io",
 	};
 
 	if (host in routes) return [routes[host], false];
-	else return [hub_host, true];
+	else return [DEFAULT_HUB_HOST, true];
 }
 
 /** @type {RequestInit} */
@@ -418,7 +445,9 @@ export default {
 		let url = new URL(request.url); // 解析请求URL
 		const userAgentHeader = request.headers.get('User-Agent');
 		const userAgent = userAgentHeader ? userAgentHeader.toLowerCase() : "null";
-		if (env.UA) 屏蔽爬虫UA = 屏蔽爬虫UA.concat(await ADD(env.UA));
+		// 修复①：屏蔽UA在请求内就地构造，不再改写模块级数组
+		let blockUA = 屏蔽爬虫UA;
+		if (env.UA) blockUA = blockUA.concat(await ADD(env.UA));
 		const workers_url = `https://${url.hostname}`;
 
 		// 获取请求参数中的 ns
@@ -426,25 +455,18 @@ export default {
 		const hostname = url.searchParams.get('hubhost') || url.hostname;
 		const hostTop = hostname.split('.')[0]; // 获取主机名的第一部分
 
-		let checkHost; // 在这里定义 checkHost 变量
-		// 如果存在 ns 参数，优先使用它来确定 hub_host
-		if (ns) {
-			if (ns === 'docker.io') {
-				hub_host = 'registry-1.docker.io'; // 设置上游地址为 registry-1.docker.io
-			} else {
-				hub_host = ns; // 直接使用 ns 作为 hub_host
-			}
-		} else {
-			checkHost = routeByHosts(hostTop);
-			hub_host = checkHost[0]; // 获取上游地址
-		}
+		// 修复②：上游地址在请求内计算并冻结为常量，消除跨请求竞态
+		const checkHost = ns ? null : routeByHosts(hostTop);
+		const hub_host = ns
+			? (ns === 'docker.io' ? DEFAULT_HUB_HOST : ns)
+			: checkHost[0];
 
 		const fakePage = checkHost ? checkHost[1] : false; // 确保 fakePage 不为 undefined
 		console.log(`域名头部: ${hostTop} 反代地址: ${hub_host} searchInterface: ${fakePage}`);
 		// 更改请求的主机名
 		url.hostname = hub_host;
 		const hubParams = ['/v1/search', '/v1/repositories'];
-		if (屏蔽爬虫UA.some(fxxk => userAgent.includes(fxxk)) && 屏蔽爬虫UA.length > 0) {
+		if (blockUA.some(fxxk => userAgent.includes(fxxk)) && blockUA.length > 0) {
 			// 首页改成一个nginx伪装页
 			return new Response(await nginx(), {
 				headers: {
@@ -494,11 +516,12 @@ export default {
 			console.log(`handle_url: ${url}`);
 		}
 
-		// 处理token请求
+		// 处理token请求（按上游选择认证端点，不再写死 Docker Hub）
 		if (url.pathname.includes('/token')) {
+			const auth = authFor(hub_host);
 			let token_parameter = {
 				headers: {
-					'Host': 'auth.docker.io',
+					'Host': new URL(auth.realm).host,
 					'User-Agent': getReqHeader("User-Agent"),
 					'Accept': getReqHeader("Accept"),
 					'Accept-Language': getReqHeader("Accept-Language"),
@@ -507,7 +530,7 @@ export default {
 					'Cache-Control': 'max-age=0'
 				}
 			};
-			let token_url = auth_url + url.pathname + url.search;
+			let token_url = auth.realm + url.pathname + url.search;
 			return fetch(new Request(token_url, request), token_parameter);
 		}
 
@@ -535,7 +558,8 @@ export default {
 				repo = v2Match[1];
 			}
 			if (repo) {
-				const tokenUrl = `${auth_url}/token?service=registry.docker.io&scope=repository:${repo}:pull`;
+				const auth = authFor(hub_host);
+				const tokenUrl = `${auth.realm}/token?service=${auth.service}&scope=repository:${repo}:pull`;
 				const tokenRes = await fetch(tokenUrl, {
 					headers: {
 						'User-Agent': getReqHeader("User-Agent"),
@@ -572,7 +596,7 @@ export default {
 				let status = original_response.status;
 				if (new_response_headers.get("Www-Authenticate")) {
 					let auth = new_response_headers.get("Www-Authenticate");
-					let re = new RegExp(auth_url, 'g');
+					let re = new RegExp(escapeRe(authFor(hub_host).realm), 'g');
 					new_response_headers.set("Www-Authenticate", response_headers.get("Www-Authenticate").replace(re, workers_url));
 				}
 				if (new_response_headers.get("Location")) {
@@ -623,7 +647,7 @@ export default {
 		// 修改 Www-Authenticate 头
 		if (new_response_headers.get("Www-Authenticate")) {
 			let auth = new_response_headers.get("Www-Authenticate");
-			let re = new RegExp(auth_url, 'g');
+			let re = new RegExp(escapeRe(authFor(hub_host).realm), 'g');
 			new_response_headers.set("Www-Authenticate", response_headers.get("Www-Authenticate").replace(re, workers_url));
 		}
 
